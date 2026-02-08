@@ -4,15 +4,11 @@ from PIL import Image
 import time
 import os
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
 MODEL_ID = "scb10x/typhoon-ocr-7b"
-IMAGE_PATH = "test.jpeg" 
+IMAGE_PATH = "test.jpeg"
 
 def load_model_and_processor():
-    """แยกการโหลดออกมาเพื่อประสิทธิภาพสูงสุด"""
-    print(f"--- 🚀 กำลังโหลด Model (ขั้นตอนนี้ทำครั้งเดียว) ---")
+    print(f"--- 🚀 Loading Model with Optimization ---")
     
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -26,87 +22,56 @@ def load_model_and_processor():
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_ID,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map="cuda", # บังคับลง GPU เท่านั้น (ถ้า error แปลว่า VRAM ไม่พอ)
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa" # เสถียรและเร็วสำหรับ Windows
+        # ถ้าใช้ RTX 3000/4000 ให้เปลี่ยนเป็น "flash_attention_2"
+        attn_implementation="sdpa" 
     )
     
-    # ปรับแต่ง Model สำหรับการ Inference
-    model.eval() 
+    model.eval()
     return model, processor
 
 def run_typhoon_ocr(model, processor, image_path):
-    if not os.path.exists(image_path):
-        print(f"❌ ไม่พบไฟล์รูปภาพ: {image_path}")
-        return
+    if not os.path.exists(image_path): return
 
-    # 1. เตรียมรูปภาพแบบรวดเร็ว
     image = Image.open(image_path).convert("RGB")
     
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": "Extract all text from this image accurately."},
-            ],
-        }
-    ]
+    # 1. ลดพิกเซลลง (448*28*28 ≈ 156,800 pixels) 
+    # นี่คือจุดเปลี่ยนชีวิตเรื่องความเร็ว!
+    min_pixels = 256 * 28 * 28
+    max_pixels = 448 * 28 * 28 
 
-    # --- ส่วนเร่งความเร็ว (Visual Token Optimization) ---
-    # บีบพิกเซลลงเล็กน้อยเพื่อให้ Process ไวขึ้น แต่ยังคงความชัดของ OCR
-    # 600,000 พิกเซล คือจุดที่สมดุลที่สุดระหว่าง Speed และ Accuracy
+    messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "Extract text"}]}]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
     inputs = processor(
         text=[text],
         images=[image],
-        padding=True,
         return_tensors="pt",
-        min_pixels=256 * 28 * 28,
-        max_pixels=800 * 28 * 28  # ปรับเป็น 800 เพื่อความเร็วที่คงที่
+        min_pixels=min_pixels,
+        max_pixels=max_pixels
     ).to("cuda")
 
-    print(f"--- 🔍 เริ่มการแกะตัวอักษร (Tokens: {inputs.input_ids.shape[1]}) ---")
-    
     start_time = time.time()
     
-    # 2. รันการประมวลผล (จูนค่าสำหรับ Speed)
+    # 2. ปรับการ Generate ให้กระชับขึ้น
     with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=1024,
+            max_new_tokens=512, # ลดจาก 1024 ถ้าข้อความในรูปไม่ได้เยอะมาก
             do_sample=False,
-            use_cache=True,             # สำคัญมาก: ช่วยให้เร็วขึ้นทวีคูณ
-            pad_token_id=processor.tokenizer.pad_token_id,
-            eos_token_id=processor.tokenizer.eos_token_id,
+            use_cache=True,
         )
 
-    # 3. ถอดรหัสผลลัพธ์
-    generated_ids = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, output_ids)
-    ]
-    result = processor.batch_decode(
-        generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
+    # 3. Decode เฉพาะส่วนที่สร้างใหม่
+    generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+    result = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-    elapsed_time = time.time() - start_time
-    
-    print("\n" + "="*40)
-    print(f"⏱️ เวลาที่ใช้: {elapsed_time:.2f} วินาที")
-    print("-" * 40)
-    print(f"✨ ผลลัพธ์:\n{result}")
-    print("="*40)
-    
-    # เคลียร์ Cache เพื่อคืน RAM ให้ระบบ (ถ้าต้องการรันต่อเนื่อง)
-    torch.cuda.empty_cache()
+    print(f"⏱️ Time taken: {time.time() - start_time:.2f} seconds")
+    print(f"✨ Result: {result}")
 
 if __name__ == "__main__":
     if torch.cuda.is_available():
-        # โหลดโมเดลไว้ก่อน
         model, processor = load_model_and_processor()
-        
-        # รัน OCR
         run_typhoon_ocr(model, processor, IMAGE_PATH)
-    else:
-        print("❌ Error: ไม่พบ GPU")
